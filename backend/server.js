@@ -2,15 +2,28 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const sqlite3 = require('sqlite3').verbose();
+const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const dns = require('dns');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = process.env.SECRET_KEY || 'your_secret_key';
+const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
+
+if (!MONGODB_URI || MONGODB_URI === 'your_mongodb_atlas_connection_string_here') {
+  console.error('MONGODB_URI is missing. Add your real MongoDB Atlas connection string in backend/.env.');
+  process.exit(1);
+}
+
+if (!MONGODB_URI.startsWith('mongodb://') && !MONGODB_URI.startsWith('mongodb+srv://')) {
+  console.error('MONGODB_URI is invalid. It must start with mongodb:// or mongodb+srv://');
+  console.error('Example: MONGODB_URI=mongodb+srv://user:password@cluster0.xxxxx.mongodb.net/my-notes?retryWrites=true&w=majority');
+  process.exit(1);
+}
 
 const sanitizeFilename = (filename) => {
   const fallback = 'note';
@@ -20,80 +33,89 @@ const sanitizeFilename = (filename) => {
     .trim() || fallback;
 };
 
-// Middleware
+const normalizeNote = (note) => ({
+  id: note._id.toString(),
+  title: note.title,
+  content: note.content,
+  file_path: note.filePath,
+  original_name: note.originalName,
+  mime_type: note.mimeType,
+  createdAt: note.createdAt,
+});
+
 app.use(cors({ exposedHeaders: ['Content-Disposition'] }));
 app.use(express.json());
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Database setup
-const db = new sqlite3.Database('./notes.db', (err) => {
-  if (err) {
-    console.error(err.message);
-  }
-  console.log('Connected to the SQLite database.');
-});
-
-// Create tables
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT
-  )`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS notes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT,
-    content TEXT,
-    file_path TEXT,
-    original_name TEXT,
-    mime_type TEXT,
-    user_id INTEGER,
-    FOREIGN KEY (user_id) REFERENCES users (id)
-  )`);
-
-  db.run('ALTER TABLE notes ADD COLUMN original_name TEXT', () => {});
-  db.run('ALTER TABLE notes ADD COLUMN mime_type TEXT', () => {});
-});
-
-// Multer setup for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+const userSchema = new mongoose.Schema(
+  {
+    username: { type: String, required: true, unique: true, trim: true },
+    password: { type: String, required: true },
   },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  }
-});
-const upload = multer({ storage });
+  { timestamps: true }
+);
 
-// Routes
+const noteSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true, trim: true },
+    content: { type: String, default: '' },
+    filePath: { type: String, default: null },
+    originalName: { type: String, default: null },
+    mimeType: { type: String, default: null },
+    fileData: { type: Buffer, default: null, select: false },
+    fileSize: { type: Number, default: 0 },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  },
+  { timestamps: true }
+);
+
+const User = mongoose.model('User', userSchema);
+const Note = mongoose.model('Note', noteSchema);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+});
+
 app.post('/register', async (req, res) => {
-  const { username, password } = req.body;
-  const hashedPassword = await bcrypt.hash(password, 10);
-  db.run('INSERT INTO users (username, password) VALUES (?, ?)', [username, hashedPassword], function(err) {
-    if (err) {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password are required' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await User.create({ username, password: hashedPassword });
+    res.json({ message: 'User registered' });
+  } catch (err) {
+    if (err.code === 11000) {
       return res.status(400).json({ error: 'User already exists' });
     }
-    res.json({ message: 'User registered' });
-  });
+    res.status(500).json({ error: 'Registration failed' });
+  }
 });
 
-app.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
-    if (err || !user || !(await bcrypt.compare(password, user.password))) {
+app.post('/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    const token = jwt.sign({ id: user.id }, SECRET_KEY);
+
+    const token = jwt.sign({ id: user._id.toString() }, SECRET_KEY);
     res.json({ token });
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Login failed' });
+  }
 });
 
-// Middleware to verify token
 const verifyToken = (req, res, next) => {
-  const token = req.headers['authorization'];
+  const token = req.headers.authorization;
   if (!token) return res.status(403).json({ error: 'No token provided' });
+
   jwt.verify(token, SECRET_KEY, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
     req.userId = decoded.id;
@@ -101,54 +123,100 @@ const verifyToken = (req, res, next) => {
   });
 };
 
-app.get('/notes', verifyToken, (req, res) => {
-  db.all('SELECT * FROM notes WHERE user_id = ?', [req.userId], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.get('/notes', verifyToken, async (req, res) => {
+  try {
+    const notes = await Note.find({ userId: req.userId }).sort({ createdAt: 1 });
+    res.json(notes.map(normalizeNote));
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch notes' });
+  }
 });
 
-app.post('/notes', verifyToken, upload.single('file'), (req, res) => {
-  const { title, content } = req.body;
-  const filePath = req.file ? req.file.path : null;
-  const originalName = req.file ? sanitizeFilename(req.file.originalname) : null;
-  const mimeType = req.file ? req.file.mimetype : null;
-  db.run(
-    'INSERT INTO notes (title, content, file_path, original_name, mime_type, user_id) VALUES (?, ?, ?, ?, ?, ?)',
-    [title, content, filePath, originalName, mimeType, req.userId],
-    function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ id: this.lastID });
+app.post('/notes', verifyToken, upload.single('file'), async (req, res) => {
+  try {
+    const { title, content } = req.body;
+
+    if (!title) {
+      return res.status(400).json({ error: 'Title is required' });
     }
-  );
+
+    const note = await Note.create({
+      title,
+      content,
+      filePath: null,
+      originalName: req.file ? sanitizeFilename(req.file.originalname) : null,
+      mimeType: req.file ? req.file.mimetype : null,
+      fileData: req.file ? req.file.buffer : null,
+      fileSize: req.file ? req.file.size : 0,
+      userId: req.userId,
+    });
+
+    res.json({ id: note._id.toString() });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to add note' });
+  }
 });
 
-app.get('/notes/:id/download', verifyToken, (req, res) => {
-  const { id } = req.params;
-  db.get('SELECT * FROM notes WHERE id = ? AND user_id = ?', [id, req.userId], (err, note) => {
-    if (err || !note) return res.status(404).json({ error: 'Note not found' });
-    if (note.file_path) {
-      const filePath = path.resolve(__dirname, note.file_path);
+app.get('/notes/:id/download', verifyToken, async (req, res) => {
+  try {
+    const note = await Note.findOne({ _id: req.params.id, userId: req.userId }).select('+fileData');
+    if (!note) return res.status(404).json({ error: 'Note not found' });
+
+    if (note.fileData) {
+      const extension = path.extname(note.originalName || '');
+      const fallbackName = `${sanitizeFilename(note.title || 'note')}${extension}`;
+      const downloadName = sanitizeFilename(note.originalName || fallbackName);
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+      res.setHeader('Content-Type', note.mimeType || 'application/octet-stream');
+      return res.send(note.fileData);
+    }
+
+    if (note.filePath) {
+      const filePath = path.resolve(__dirname, note.filePath);
       if (!fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'File not found on server' });
       }
 
       const extension = path.extname(filePath);
       const fallbackName = `${sanitizeFilename(note.title || 'note')}${extension}`;
-      const downloadName = sanitizeFilename(note.original_name || fallbackName);
-      if (note.mime_type) {
-        res.type(note.mime_type);
+      const downloadName = sanitizeFilename(note.originalName || fallbackName);
+      if (note.mimeType) {
+        res.type(note.mimeType);
       }
-      res.download(filePath, downloadName);
-    } else {
-      const safeTitle = sanitizeFilename(note.title || 'note');
-      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.txt"`);
-      res.setHeader('Content-Type', 'text/plain');
-      res.send(note.content);
+      return res.download(filePath, downloadName);
     }
+
+    const safeTitle = sanitizeFilename(note.title || 'note');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.txt"`);
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(note.content);
+  } catch (err) {
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const startServer = async () => {
+  try {
+    dns.setDefaultResultOrder('ipv4first');
+    await mongoose.connect(MONGODB_URI, {
+      serverSelectionTimeoutMS: 15000,
+    });
+    console.log('Connected to MongoDB Atlas.');
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error('MongoDB connection failed:', err.message);
+    console.error('Check Atlas Network Access and add your current IP or 0.0.0.0/0 while testing.');
+    process.exit(1);
+  }
+};
+
+startServer();
