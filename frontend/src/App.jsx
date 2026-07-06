@@ -14,7 +14,10 @@ import {
 import axios from 'axios';
 import './App.css';
 
-const API_BASE = import.meta.env.VITE_API_URL;
+const LOCAL_API_BASE = 'http://localhost:5000';
+const DEPLOYED_API_BASE = 'https://my-notes-uuhg.onrender.com';
+const isLocalHost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+const API_BASE = isLocalHost ? (import.meta.env.VITE_API_URL || LOCAL_API_BASE) : DEPLOYED_API_BASE;
 const TEACHER_USERNAME = (import.meta.env.VITE_TEACHER_USERNAME || 'mr alok').trim().toLowerCase();
 
 const containerVariants = {
@@ -82,7 +85,7 @@ function App() {
       localStorage.setItem('token', res.data.token);
       localStorage.setItem('studentName', username);
     } catch (err) {
-      alert('Login failed');
+      alert(err.response?.data?.error || 'Login failed. Backend URL or credentials check karo.');
     } finally {
       setIsSubmitting(false);
     }
@@ -99,7 +102,7 @@ function App() {
       setRegisterData({ username: '', password: '' });
       setIsRegister(false);
     } catch (err) {
-      alert('Registration failed');
+      alert(err.response?.data?.error || 'Registration failed. Backend URL or credentials check karo.');
     } finally {
       setIsSubmitting(false);
     }
