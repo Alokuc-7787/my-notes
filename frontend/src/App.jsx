@@ -4,6 +4,7 @@ import {
   FaArrowRight,
   FaBookOpen,
   FaCloudUploadAlt,
+  FaTrash,
   FaDownload,
   FaFileAlt,
   FaLock,
@@ -13,7 +14,8 @@ import {
 import axios from 'axios';
 import './App.css';
 
-const API_BASE = 'http://localhost:5000';
+const API_BASE = import.meta.env.VITE_API_URL;
+const TEACHER_USERNAME = (import.meta.env.VITE_TEACHER_USERNAME || 'mr alok').trim().toLowerCase();
 
 const containerVariants = {
   hidden: { opacity: 0 },
@@ -47,6 +49,7 @@ function App() {
   const [isRegister, setIsRegister] = useState(false);
   const [newNote, setNewNote] = useState({ title: '', content: '', file: null });
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const isTeacher = studentName.trim().toLowerCase() === TEACHER_USERNAME;
 
   useEffect(() => {
     if (token) {
@@ -74,9 +77,10 @@ function App() {
     try {
       const res = await axios.post(`${API_BASE}/login`, loginData);
       setToken(res.data.token);
-      setStudentName(loginData.username);
+      const username = res.data.username || loginData.username;
+      setStudentName(username);
       localStorage.setItem('token', res.data.token);
-      localStorage.setItem('studentName', loginData.username);
+      localStorage.setItem('studentName', username);
     } catch (err) {
       alert('Login failed');
     } finally {
@@ -103,6 +107,11 @@ function App() {
 
   const handleAddNote = async (event) => {
     event.preventDefault();
+    if (!isTeacher) {
+      alert('Only teacher can upload notes');
+      return;
+    }
+
     const formData = new FormData();
     formData.append('title', newNote.title);
     formData.append('content', newNote.content);
@@ -140,6 +149,19 @@ function App() {
       URL.revokeObjectURL(fileUrl);
     } catch (err) {
       alert('Download failed. Please login again and try.');
+    }
+  };
+
+  const handleDeleteNote = async (note) => {
+    if (!window.confirm(`Delete "${note.title}"?`)) return;
+
+    try {
+      await axios.delete(`${API_BASE}/notes/${note.id}`, {
+        headers: { Authorization: token },
+      });
+      fetchNotes();
+    } catch (err) {
+      alert('Only teacher can delete notes');
     }
   };
 
@@ -233,41 +255,43 @@ function App() {
         </button>
       </header>
 
-      <motion.form
-        initial={{ opacity: 0, y: 18 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.1 }}
-        onSubmit={handleAddNote}
-        className="upload-panel"
-      >
-        <div>
-          <span className="section-kicker">Upload Notes</span>
-          <h2>Add new study material</h2>
-        </div>
-        <input
-          type="text"
-          placeholder="Note title"
-          value={newNote.title}
-          onChange={(event) => setNewNote({ ...newNote, title: event.target.value })}
-          required
-        />
-        <textarea
-          placeholder="Short description or written note"
-          value={newNote.content}
-          onChange={(event) => setNewNote({ ...newNote, content: event.target.value })}
-        />
-        <label className="file-picker">
-          <FaCloudUploadAlt />
-          <span>{newNote.file ? newNote.file.name : 'Attach PDF, DOCX or image'}</span>
+      {isTeacher && (
+        <motion.form
+          initial={{ opacity: 0, y: 18 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.1 }}
+          onSubmit={handleAddNote}
+          className="upload-panel"
+        >
+          <div>
+            <span className="section-kicker">Upload Notes</span>
+            <h2>Add new study material</h2>
+          </div>
           <input
-            type="file"
-            onChange={(event) => setNewNote({ ...newNote, file: event.target.files[0] })}
+            type="text"
+            placeholder="Note title"
+            value={newNote.title}
+            onChange={(event) => setNewNote({ ...newNote, title: event.target.value })}
+            required
           />
-        </label>
-        <button className="primary-button compact" type="submit">
-          <FaCloudUploadAlt /> Add Note
-        </button>
-      </motion.form>
+          <textarea
+            placeholder="Short description or written note"
+            value={newNote.content}
+            onChange={(event) => setNewNote({ ...newNote, content: event.target.value })}
+          />
+          <label className="file-picker">
+            <FaCloudUploadAlt />
+            <span>{newNote.file ? newNote.file.name : 'Attach PDF, DOCX or image'}</span>
+            <input
+              type="file"
+              onChange={(event) => setNewNote({ ...newNote, file: event.target.files[0] })}
+            />
+          </label>
+          <button className="primary-button compact" type="submit">
+            <FaCloudUploadAlt /> Add Note
+          </button>
+        </motion.form>
+      )}
 
       <AnimatePresence mode="popLayout">
         {sortedNotes.length > 0 ? (
@@ -291,9 +315,16 @@ function App() {
                 </div>
                 <h3>{note.title}</h3>
                 <p>{note.content || 'No description added yet.'}</p>
-                <button type="button" onClick={() => handleDownload(note)}>
-                  <FaDownload /> Download
-                </button>
+                <div className="note-actions">
+                  <button type="button" onClick={() => handleDownload(note)}>
+                    <FaDownload /> Download
+                  </button>
+                  {isTeacher && (
+                    <button className="delete-button" type="button" onClick={() => handleDeleteNote(note)}>
+                      <FaTrash /> Delete
+                    </button>
+                  )}
+                </div>
               </motion.article>
             ))}
           </motion.section>

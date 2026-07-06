@@ -13,6 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = process.env.SECRET_KEY || 'your_secret_key';
 const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
+const TEACHER_USERNAME = (process.env.TEACHER_USERNAME || 'mr alok').trim().toLowerCase();
 
 if (!MONGODB_URI || MONGODB_URI === 'your_mongodb_atlas_connection_string_here') {
   console.error('MONGODB_URI is missing. Add your real MongoDB Atlas connection string in backend/.env.');
@@ -42,6 +43,8 @@ const normalizeNote = (note) => ({
   mime_type: note.mimeType,
   createdAt: note.createdAt,
 });
+
+const isTeacher = (username) => username?.trim().toLowerCase() === TEACHER_USERNAME;
 
 app.use(cors({ exposedHeaders: ['Content-Disposition'] }));
 app.use(express.json());
@@ -105,8 +108,8 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign({ id: user._id.toString() }, SECRET_KEY);
-    res.json({ token });
+    const token = jwt.sign({ id: user._id.toString(), username: user.username }, SECRET_KEY);
+    res.json({ token, username: user.username, role: isTeacher(user.username) ? 'teacher' : 'student' });
   } catch (err) {
     res.status(500).json({ error: 'Login failed' });
   }
@@ -119,20 +122,39 @@ const verifyToken = (req, res, next) => {
   jwt.verify(token, SECRET_KEY, (err, decoded) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
     req.userId = decoded.id;
+    req.username = decoded.username;
+    req.isTeacher = isTeacher(decoded.username);
     next();
   });
 };
 
+const requireTeacher = async (req, res, next) => {
+  if (req.isTeacher) return next();
+
+  try {
+    const user = await User.findById(req.userId);
+    if (isTeacher(user?.username)) {
+      req.username = user.username;
+      req.isTeacher = true;
+      return next();
+    }
+  } catch (err) {
+    return res.status(500).json({ error: 'Permission check failed' });
+  }
+
+  return res.status(403).json({ error: 'Only teacher can manage notes' });
+};
+
 app.get('/notes', verifyToken, async (req, res) => {
   try {
-    const notes = await Note.find({ userId: req.userId }).sort({ createdAt: 1 });
+    const notes = await Note.find({}).sort({ createdAt: 1 });
     res.json(notes.map(normalizeNote));
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch notes' });
   }
 });
 
-app.post('/notes', verifyToken, upload.single('file'), async (req, res) => {
+app.post('/notes', verifyToken, requireTeacher, upload.single('file'), async (req, res) => {
   try {
     const { title, content } = req.body;
 
@@ -159,7 +181,7 @@ app.post('/notes', verifyToken, upload.single('file'), async (req, res) => {
 
 app.get('/notes/:id/download', verifyToken, async (req, res) => {
   try {
-    const note = await Note.findOne({ _id: req.params.id, userId: req.userId }).select('+fileData');
+    const note = await Note.findById(req.params.id).select('+fileData');
     if (!note) return res.status(404).json({ error: 'Note not found' });
 
     if (note.fileData) {
@@ -195,6 +217,16 @@ app.get('/notes/:id/download', verifyToken, async (req, res) => {
   }
 });
 
+app.delete('/notes/:id', verifyToken, requireTeacher, async (req, res) => {
+  try {
+    const note = await Note.findByIdAndDelete(req.params.id);
+    if (!note) return res.status(404).json({ error: 'Note not found' });
+    res.json({ message: 'Note deleted' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete note' });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -209,8 +241,16 @@ const startServer = async () => {
       serverSelectionTimeoutMS: 15000,
     });
     console.log('Connected to MongoDB Atlas.');
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
+    });
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Backend is probably already running.`);
+        console.error(`Open http://localhost:${PORT}/health to verify the running server.`);
+        process.exit(1);
+      }
+      throw err;
     });
   } catch (err) {
     console.error('MongoDB connection failed:', err.message);
